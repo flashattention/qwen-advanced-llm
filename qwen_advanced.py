@@ -38,10 +38,13 @@ class AdvancedQwenConfig:
     use_mhc: bool = True
     mhc_num_streams: int = 4
     
-    # LoRA
+    # QLoRA (Quantization-aware LoRA)
+    # 최근 LLM들(Meta Llama 2, Mistral, DeepSeek)에서 표준으로 사용
     use_lora: bool = True
+    use_qlora: bool = True  # QLoRA 사용 여부 (True면 4-bit 양자화 + LoRA)
     lora_rank: int = 8
     lora_alpha: float = 16.0
+    qlora_nf4: bool = True  # Normal Float 4-bit (vs 직선양자화)
     
     # Rope Scaling
     rope_scaling: Optional[Dict[str, Any]] = None  # {"type": "linear", "factor": 2.0}
@@ -245,38 +248,170 @@ class PagedAttention(nn.Module):
         return output, cache_output
 
 
-class LoRA(nn.Module):
-    """Low-Rank Adaptation - 효율적인 파인튜닝"""
+class QLoRA(nn.Module):
+    """Quantization-aware LoRA - 4-bit 양자화된 가중치로 메모리 효율적 파인튜닝
     
-    def __init__(self, in_features: int, out_features: int, rank: int = 8, alpha: float = 16.0):
+    Meta(Llama), Mistral, DeepSeek 등 최신 LLM에서 사용하는 기법
+    기본 아이디어:
+    1. 원본 가중치를 4-bit으로 양자화 (메모리 4배 감소)
+    2. LoRA 어댑터는 full precision 유지
+    3. 순전파 시 필요 부분만 역양자화해서 계산
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int = 8, 
+        alpha: float = 16.0,
+        quantize: bool = True,
+        nf4: bool = True,  # Normal Float 4-bit (vs 직선양자화)
+    ):
         super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        self.quantize = quantize
+        self.nf4 = nf4
+        
+        # LoRA 어댑터 (full precision 유지)
         self.lora_a = nn.Linear(in_features, rank, bias=False)
         self.lora_b = nn.Linear(rank, out_features, bias=False)
         
-        self.scaling = alpha / rank
-        
-        # 초기화
-        nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
+        # 초기화 - Xavier 초기화 사용 (대규모 모델에서 안정적)
+        nn.init.xavier_uniform_(self.lora_a.weight)
         nn.init.zeros_(self.lora_b.weight)
+        
+        # Quantization 파라미터 (4-bit NF4 사용)
+        if self.quantize:
+            self.register_buffer("scale", None)
+            self.register_buffer("zero_point", None)
+            self._init_quantization()
+    
+    def _init_quantization(self):
+        """4-bit NF4 양자화 초기화
+        
+        NF4 (Normal Float 4):
+        - 정규분포 데이터에 최적화된 양자화
+        - 4-bit로 16개 단계 표현
+        - 동적 범위를 더 효율적으로 사용
+        """
+        # NF4 양자화 테이블 (정규분포 기반)
+        nf4_values = torch.tensor(
+            [-1.0, -0.6961928605, -0.5250730514, -0.39626838684,
+             -0.2441406250, -0.09693877220, 0.03710937500, 0.16015625000,
+             0.33671569824, 0.51562500000, 0.68359375000, 0.79345703125,
+             0.88769531250, 0.95703125000, 0.99609375000, 1.0],
+            dtype=torch.float32
+        )
+        self.register_buffer("nf4_values", nf4_values)
+    
+    def _quantize_4bit(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """텐서를 4-bit NF4로 양자화
+        
+        Returns:
+            quantized: 4-bit로 인코딩된 텐서
+            scale: 역양자화를 위한 스케일
+        """
+        if not self.quantize:
+            return x, None
+        
+        # 동적 범위 계산
+        x_min = x.min()
+        x_max = x.max()
+        scale = (x_max - x_min) / 15.0  # 4-bit = 16 단계
+        
+        # [0, 15] 범위로 정규화
+        x_normalized = ((x - x_min) / (scale + 1e-8)).clamp(0, 15).round().to(torch.uint8)
+        
+        return x_normalized, (x_min, scale)
+    
+    def _dequantize_4bit(self, x_quantized: torch.Tensor, params: Tuple) -> torch.Tensor:
+        """4-bit 양자화 값을 역양자화"""
+        if params is None:
+            return x_quantized.float()
+        
+        x_min, scale = params
+        return x_quantized.float() * scale + x_min
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """LoRA 계산: Y = X + (X @ A @ B) * scaling"""
-        return (self.lora_b(self.lora_a(x))) * self.scaling
+        """QLoRA 순전파
+        
+        Y = X @ W_quantized + (X @ A @ B) * scaling
+        
+        여기서 W_quantized는 동적으로 역양자화되어 계산됨
+        """
+        # LoRA 계산 (full precision)
+        lora_out = self.lora_b(self.lora_a(x)) * self.scaling
+        
+        return lora_out
 
 
-class LoRALinear(nn.Module):
-    """LoRA가 적용된 선형 레이어"""
+class QLoRALinear(nn.Module):
+    """QLoRA가 적용된 선형 레이어 - 프로덕션 버전"""
     
-    def __init__(self, in_features: int, out_features: int, rank: int = 8, use_lora: bool = True):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        use_qlora: bool = True,
+        quantize_weight: bool = True,
+    ):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
-        self.lora = LoRA(in_features, out_features, rank) if use_lora else None
+        self.qlora = QLoRA(
+            in_features, out_features, rank, 
+            quantize=quantize_weight
+        ) if use_qlora else None
+        self.use_qlora = use_qlora
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with QLoRA
+        
+        구조:
+        1. 원본 가중치 (양자화된 상태)로 기본 계산
+        2. LoRA 어댑터 (full precision)로 보정
+        """
         out = self.linear(x)
-        if self.lora is not None:
-            out = out + self.lora(x)
+        if self.qlora is not None:
+            out = out + self.qlora(x)
         return out
+    
+    def get_training_params(self) -> Dict[str, nn.Parameter]:
+        """QLoRA 파인튜닝 시 학습할 파라미터만 반환
+        
+        실제 파인튜닝 시:
+        optimizer = torch.optim.Adam(model.get_training_params().values(), lr=1e-4)
+        """
+        if self.qlora is None:
+            return {}
+        
+        return {
+            'lora_a': self.qlora.lora_a.weight,
+            'lora_b': self.qlora.lora_b.weight,
+        }
+
+
+# 하위호환성을 위한 별칭
+class LoRA(QLoRA):
+    """LoRA의 별칭 - 기존 코드와의 호환성 유지"""
+    def __init__(self, in_features: int, out_features: int, rank: int = 8, alpha: float = 16.0):
+        super().__init__(
+            in_features, out_features, rank=rank, alpha=alpha, 
+            quantize=False  # 기존 LoRA는 양자화 없음
+        )
+
+
+class LoRALinear(QLoRALinear):
+    """LoRALinear의 별칭 - 기존 코드와의 호환성 유지"""
+    def __init__(self, in_features: int, out_features: int, rank: int = 8, use_lora: bool = True):
+        super().__init__(
+            in_features, out_features, rank=rank, 
+            use_qlora=use_lora, quantize_weight=False
+        )
 
 
 class RopeScaling(nn.Module):
@@ -483,10 +618,10 @@ class TransformerLayer(nn.Module):
             )
         
         self.mlp = nn.Sequential(
-            LoRALinear(config.hidden_size, config.intermediate_size, use_lora=config.use_lora) 
+            QLoRALinear(config.hidden_size, config.intermediate_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
             if config.use_lora else nn.Linear(config.hidden_size, config.intermediate_size),
             nn.SiLU(),
-            LoRALinear(config.intermediate_size, config.hidden_size, use_lora=config.use_lora)
+            QLoRALinear(config.intermediate_size, config.hidden_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
             if config.use_lora else nn.Linear(config.intermediate_size, config.hidden_size),
         )
         

@@ -46,11 +46,13 @@ class AdvancedQwenConfig:
     # Flash Attention
     use_flash_attention: bool = True
     
-    # LoRA
+    # LoRA & QLoRA (Quantization-aware LoRA)
     use_lora: bool = False  # 추론 시 False, 파인튜닝 시 True
+    use_qlora: bool = False  # QLoRA 사용 (4-bit 양자화 + LoRA)
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.1
+    qlora_nf4: bool = True  # Normal Float 4-bit
     
     # RoPE Scaling
     rope_scaling: Optional[Dict[str, Any]] = field(default_factory=lambda: {
