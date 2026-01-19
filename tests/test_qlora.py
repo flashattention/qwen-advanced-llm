@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """QLoRA 구현 테스트"""
 
+import sys
+from pathlib import Path
+
+# 부모 디렉토리를 경로에 추가
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from qwen_advanced import AdvancedQwenConfig, AdvancedQwenLM, QLoRA, QLoRALinear
 import torch
 

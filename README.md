@@ -10,7 +10,7 @@
 │   ├── Flash Attention
 │   ├── GQA (Grouped Query Attention)
 │   ├── mHC (Manifold-Constrained Hyper-Connections)
-│   ├── LoRA
+│   ├── QLoRA (Quantization-aware LoRA)
 │   └── Rope Scaling + Continuous Batching
 │
 ├── qwen_vllm_compatible.py       # 프로덕션 배포 버전
@@ -19,10 +19,17 @@
 │   ├── Config/Checkpoint 관리
 │   └── Generation API
 │
-├── qwen_model/                   # qwen_advanced.py의 체크포인트
-├── qwen_hf_model/                # qwen_vllm_compatible.py의 체크포인트
+├── checkpoints/                  # 모델 체크포인트
+│   ├── qwen_model/              # qwen_advanced.py의 체크포인트
+│   └── qwen_hf_model/            # qwen_vllm_compatible.py의 체크포인트
 │
-└── IMPROVEMENTS.md               # 개선사항 상세 가이드
+├── tests/                        # 테스트 스크립트
+│   └── test_qlora.py            # QLoRA 기능 테스트
+│
+├── venv/                         # 파이썬 가상환경
+├── requirements.txt              # 의존성 패키지
+├── IMPROVEMENTS.md               # 개선사항 상세 가이드
+└── README.md                     # 프로젝트 설명서
 ```
 
 ## 🚀 사용 흐름

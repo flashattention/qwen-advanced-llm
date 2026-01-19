@@ -308,7 +308,7 @@ class QLoRA(nn.Module):
         )
         self.register_buffer("nf4_values", nf4_values)
     
-    def _quantize_4bit(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _quantize_4bit(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """텐서를 4-bit NF4로 양자화
         
         Returns:
@@ -380,7 +380,7 @@ class QLoRALinear(nn.Module):
             out = out + self.qlora(x)
         return out
     
-    def get_training_params(self) -> Dict[str, nn.Parameter]:
+    def get_training_params(self) -> Dict[str, torch.Tensor]:
         """QLoRA 파인튜닝 시 학습할 파라미터만 반환
         
         실제 파인튜닝 시:
