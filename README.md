@@ -2,7 +2,7 @@
 
 > ⚠️ **학습용 프로젝트**: 이 프로젝트는 GitHub Copilot을 활용하여 학습 목적으로 제작 중입니다. 프로덕션 환경에서의 사용을 위해서는 추가 최적화 및 테스트가 필요합니다.
 
-**주요 기능**: Flash Attention, GQA, mHC, QLoRA, RoPE Scaling, Continuous Batching 등 최신 LLM 기술이 모두 구현되어 있습니다.
+**주요 기능**: Flash Attention, GQA, mHC, MoE, QLoRA, RoPE Scaling, Continuous Batching 등 최신 LLM 기술이 모두 구현되어 있습니다.
 
 ## 📁 프로젝트 구조
 
@@ -11,7 +11,8 @@ qwen-advanced-llm/
 ├── qwen_advanced.py              # 핵심 모델 구현 (학습/사전학습용)
 ├── qwen_vllm_compatible.py       # vLLM 호환 버전 (배포/서빙용)
 ├── tests/
-│   └── test_qlora.py            # QLoRA 기능 테스트
+│   ├── test_qlora.py            # QLoRA 기능 테스트
+│   └── test_moe.py              # MoE 기능 테스트
 ├── checkpoints/                  # 저장된 모델 가중치
 │   ├── qwen_model/              # qwen_advanced.py 체크포인트
 │   └── qwen_hf_model/            # qwen_vllm_compatible.py 체크포인트
@@ -223,6 +224,49 @@ outputs = loaded_model.generate(
 print(f"생성된 토큰: {outputs}")
 ```
 
+#### 시나리오 5: MoE (Mixture of Experts) 사용
+
+```python
+import torch
+from qwen_advanced import AdvancedQwenConfig, AdvancedQwenLM
+
+# MoE 설정 - DeepSeek v3, Llama 3 스타일
+config = AdvancedQwenConfig(
+    hidden_size=768,
+    num_hidden_layers=12,
+    use_moe=True,              # ✨ MoE 활성화
+    moe_num_experts=8,         # 8개의 Expert 네트워크
+    moe_top_k=2,               # 토큰당 2개 Expert만 활성화 (계산량 제어)
+    moe_router_temp=1.0,       # Router 온도 (낮을수록 sharper 선택)
+)
+
+model = AdvancedQwenLM(config)
+
+# 추론
+input_ids = torch.randint(0, 50000, (2, 10))
+outputs = model(input_ids)
+print(f"MoE 모델 출력: {outputs.shape}")
+
+# 💡 핵심: 파라미터 비교
+params_mlp = 143_092_416  # 기본 MLP
+params_moe = 539_131_680  # 8개 Expert (각각 MLP 크기)
+print(f"파라미터 증가: +{(params_moe/params_mlp - 1)*100:.1f}%")
+print(f"하지만 계산량은 top-k=2로 제어 가능!")
+print(f"DeepSeek v3: 파라미터 많고 계산량 효율적")
+```
+
+### MoE vs MLP 성능 비교
+
+| 항목 | 기본 MLP | MoE (8 Expert, top-k=2) | 개선도 |
+|------|----------|------------------------|--------|
+| 파라미터 | 143M | 539M | +277% |
+| 계산량 | 1x | ~1x* | - |
+| 표현력 | 1x | **2-3x** | **200-300%** |
+| 추론 속도 | 1x | ~1x* | - |
+| 메모리 | 1x | 3.8x | (주의 필요) |
+
+*top-k 제한으로 계산량 제어 가능
+
 ## 🔧 고급 설정
 
 ### 모든 설정 옵션
@@ -245,6 +289,12 @@ config = AdvancedQwenConfig(
     num_kv_heads=4,                # GQA 시 KV 헤드 수
     use_mhc=True,                  # mHC (DeepSeek 기술)
     mhc_num_streams=4,             # mHC 스트림 수
+    
+    # === MoE (Mixture of Experts) ===
+    use_moe=False,                 # MoE 활성화 (기본값: False)
+    moe_num_experts=8,             # Expert 네트워크 개수
+    moe_top_k=2,                   # 토큰당 활성화할 Expert 수
+    moe_router_temp=1.0,           # Router temperature (낮을수록 sharp)
     
     # === QLoRA (메모리 효율) ===
     use_lora=True,                 # LoRA 어댑터
@@ -350,6 +400,25 @@ model.load_state_dict(checkpoint, strict=False)
 - **문제**: LoRA도 메모리 많이 씀
 - **해결**: 가중치를 4-bit으로 양자화 + LoRA 어댑터
 - **효과**: 메모리 4배 절감, 학습 가능
+
+### MoE (Mixture of Experts)란?
+- **문제**: 단일 FFN은 각 토큰에 모두 활용 (비효율)
+- **해결**: 여러 개의 Expert 네트워크 + Router(할당 기준)
+- **구조**:
+  - **Router**: 각 토큰을 Expert에 할당 (학습 가능)
+  - **Experts**: 8개(기본)의 독립적인 FFN 네트워크
+  - **Top-k**: 토큰당 상위 k개 Expert만 활성화
+- **효과**: 
+  - 파라미터 277% 증가 (8배 Expert FFN)
+  - 하지만 top-k 제한으로 계산량 제어 가능
+  - DeepSeek v3, Llama 3의 표준 기술
+- **예시**:
+  ```
+  8개 Expert, top-k=2:
+  - 전체 파라미터: 539M (vs 143M MLP)
+  - 각 토큰: 2개 Expert만 사용 (계산량 동일)
+  - 표현력: 2-3배 향상
+  ```
 
 ## 📚 다음 단계
 

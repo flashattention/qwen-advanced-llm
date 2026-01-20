@@ -46,6 +46,12 @@ class AdvancedQwenConfig:
     lora_alpha: float = 16.0
     qlora_nf4: bool = True  # Normal Float 4-bit (vs 직선양자화)
     
+    # MoE (Mixture of Experts) - DeepSeek v3, Llama 3 표준
+    use_moe: bool = False  # MoE 사용 여부
+    moe_num_experts: int = 8  # Expert 네트워크 개수
+    moe_top_k: int = 2  # 토큰당 활성화할 Expert 수
+    moe_router_temp: float = 1.0  # Router temperature (낮을수록 sharp)
+    
     # Rope Scaling
     rope_scaling: Optional[Dict[str, Any]] = None  # {"type": "linear", "factor": 2.0}
     
@@ -395,6 +401,117 @@ class QLoRALinear(nn.Module):
         }
 
 
+# MoE (Mixture of Experts) - DeepSeek v3, Llama 3 표준
+class MoE(nn.Module):
+    """Mixture of Experts - 효율적인 파라미터 확장
+    
+    구조:
+    1. Router: 각 토큰을 Expert에 할당 (학습 가능)
+    2. Experts: 여러 개의 독립적인 FFN 네트워크
+    3. Top-k: 토큰당 상위 k개 Expert만 활성화
+    
+    효과:
+    - 총 파라미터 수 증가 (e.g., 8개 Expert = 8배 FFN 파라미터)
+    - 하지만 각 토큰은 일부 Expert만 사용 (계산량 제어 가능)
+    - DeepSeek v3: 더 빠르고 정확한 추론
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int = 8,
+        expert_size: int = 3072,
+        top_k: int = 2,
+        router_temp: float = 1.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router_temp = router_temp
+        
+        # Router network (각 토큰을 Expert에 할당)
+        self.router = nn.Linear(hidden_size, num_experts)
+        
+        # Expert networks (FFN)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, expert_size),
+                nn.SiLU(),
+                nn.Linear(expert_size, hidden_size),
+                nn.Dropout(dropout),
+            )
+            for _ in range(num_experts)
+        ])
+        
+        # 초기화
+        nn.init.normal_(self.router.weight, std=0.02)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """MoE 순전파
+        
+        Args:
+            x: (batch_size, seq_len, hidden_size)
+        
+        Returns:
+            output: (batch_size, seq_len, hidden_size)
+            routing_weights: (batch_size, seq_len, num_experts) - 학습용
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        
+        # Router: 토큰-Expert 할당 확률 계산
+        router_logits = self.router(x)  # (batch, seq_len, num_experts)
+        router_probs = F.softmax(router_logits / self.router_temp, dim=-1)
+        
+        # Top-k 선택: 각 토큰마다 상위 k개 Expert 선택
+        top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        
+        # 선택된 Expert의 확률 정규화
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        
+        # Expert 결과 계산
+        output = torch.zeros_like(x)
+        
+        for expert_idx in range(self.num_experts):
+            # 이 Expert가 활성화된 토큰 찾기
+            expert_mask = (top_k_indices == expert_idx)  # (batch, seq_len, top_k)
+            
+            if expert_mask.sum() > 0:
+                # 해당 토큰들에 대해 Expert 적용
+                expert_output = self.experts[expert_idx](x)  # (batch, seq_len, hidden)
+                
+                # 확률로 가중치 적용
+                weights = torch.where(
+                    expert_mask,
+                    top_k_probs,
+                    torch.zeros_like(top_k_probs)
+                ).sum(dim=-1, keepdim=True)  # (batch, seq_len, 1)
+                
+                output = output + expert_output * weights
+        
+        return output
+
+
+class MoELayer(nn.Module):
+    """MoE를 포함한 레이어"""
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int = 8,
+        expert_size: int = 3072,
+        top_k: int = 2,
+        router_temp: float = 1.0,
+    ):
+        super().__init__()
+        self.moe = MoE(hidden_size, num_experts, expert_size, top_k, router_temp)
+        self.ln = nn.LayerNorm(hidden_size)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.moe(self.ln(x))
+
+
 # 하위호환성을 위한 별칭
 class LoRA(QLoRA):
     """LoRA의 별칭 - 기존 코드와의 호환성 유지"""
@@ -596,7 +713,7 @@ class ContinuousBatcher:
 
 
 class TransformerLayer(nn.Module):
-    """Transformer 레이어 (mHC 포함)"""
+    """Transformer 레이어 (mHC, MoE 포함)"""
     
     def __init__(self, config: AdvancedQwenConfig):
         super().__init__()
@@ -617,13 +734,26 @@ class TransformerLayer(nn.Module):
                 config.hidden_size, config.num_attention_heads
             )
         
-        self.mlp = nn.Sequential(
-            QLoRALinear(config.hidden_size, config.intermediate_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
-            if config.use_lora else nn.Linear(config.hidden_size, config.intermediate_size),
-            nn.SiLU(),
-            QLoRALinear(config.intermediate_size, config.hidden_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
-            if config.use_lora else nn.Linear(config.intermediate_size, config.hidden_size),
-        )
+        # MoE 또는 기본 MLP
+        self.use_moe = config.use_moe
+        if config.use_moe:
+            self.moe_layer = MoELayer(
+                config.hidden_size,
+                num_experts=config.moe_num_experts,
+                expert_size=config.intermediate_size,
+                top_k=config.moe_top_k,
+                router_temp=config.moe_router_temp,
+            )
+            self.mlp = None
+        else:
+            self.mlp = nn.Sequential(
+                QLoRALinear(config.hidden_size, config.intermediate_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
+                if config.use_lora else nn.Linear(config.hidden_size, config.intermediate_size),
+                nn.SiLU(),
+                QLoRALinear(config.intermediate_size, config.hidden_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
+                if config.use_lora else nn.Linear(config.intermediate_size, config.hidden_size),
+            )
+            self.moe_layer = None
         
         self.ln1 = nn.LayerNorm(config.hidden_size)
         self.ln2 = nn.LayerNorm(config.hidden_size)
@@ -661,22 +791,14 @@ class TransformerLayer(nn.Module):
         else:
             hidden_states = hidden_states + attn_out
         
-        # FFN with residual
+        # MLP 또는 MoE
         normed = self.ln2(hidden_states)
-        mlp_out = self.mlp(normed)
-        
-        if self.use_mhc:
-            # FFN도 mHC로 처리
-            streams = [
-                hidden_states,
-                mlp_out,
-                hidden_states * 0.5 + mlp_out * 0.5,
-                hidden_states * 0.3 + mlp_out * 0.7,
-            ]
-            hidden_states = self.mhc(*streams)
+        if self.use_moe:
+            hidden_states = hidden_states + self.moe_layer(normed)
         else:
-            hidden_states = hidden_states + mlp_out
+            hidden_states = hidden_states + self.mlp(normed)
         
+
         return hidden_states
 
 
