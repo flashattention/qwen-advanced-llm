@@ -736,24 +736,24 @@ class TransformerLayer(nn.Module):
         
         # MoE 또는 기본 MLP
         self.use_moe = config.use_moe
-        if config.use_moe:
-            self.moe_layer = MoELayer(
-                config.hidden_size,
-                num_experts=config.moe_num_experts,
-                expert_size=config.intermediate_size,
-                top_k=config.moe_top_k,
-                router_temp=config.moe_router_temp,
-            )
-            self.mlp = None
-        else:
-            self.mlp = nn.Sequential(
-                QLoRALinear(config.hidden_size, config.intermediate_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
-                if config.use_lora else nn.Linear(config.hidden_size, config.intermediate_size),
-                nn.SiLU(),
-                QLoRALinear(config.intermediate_size, config.hidden_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
-                if config.use_lora else nn.Linear(config.intermediate_size, config.hidden_size),
-            )
-            self.moe_layer = None
+        
+        # 항상 MLP 초기화 (MoE 사용 여부와 무관)
+        self.mlp = nn.Sequential(
+            QLoRALinear(config.hidden_size, config.intermediate_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
+            if config.use_lora else nn.Linear(config.hidden_size, config.intermediate_size),
+            nn.SiLU(),
+            QLoRALinear(config.intermediate_size, config.hidden_size, use_qlora=config.use_lora, quantize_weight=config.use_qlora)
+            if config.use_lora else nn.Linear(config.intermediate_size, config.hidden_size),
+        )
+        
+        # MoE도 항상 초기화 (사용 여부와 무관)
+        self.moe_layer = MoELayer(
+            config.hidden_size,
+            num_experts=config.moe_num_experts,
+            expert_size=config.intermediate_size,
+            top_k=config.moe_top_k,
+            router_temp=config.moe_router_temp,
+        )
         
         self.ln1 = nn.LayerNorm(config.hidden_size)
         self.ln2 = nn.LayerNorm(config.hidden_size)
